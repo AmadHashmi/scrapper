@@ -60,10 +60,8 @@ def export_to_excel(records: Iterable[ListingRecord], output_file: Path) -> int:
             cell = worksheet.cell(row=1, column=column_idx)
             cell.font = Font(bold=True)
 
-            max_cell_length = max(
-                len(str(column_name)),
-                *(len(str(value)) for value in dataframe[column_name].fillna("")),
-            )
+            value_lengths = [len(str(value)) for value in dataframe[column_name].fillna("")]
+            max_cell_length = max([len(str(column_name)), *value_lengths])
             worksheet.column_dimensions[cell.column_letter].width = min(max_cell_length + 2, 70)
 
     return len(dataframe)
