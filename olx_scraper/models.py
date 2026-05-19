@@ -25,6 +25,9 @@ class ListingRecord:
     address: str = ""
     seller_type: str = ""
     property_type: str = ""
+    phone: str = ""
+    masked_phone: str = ""
+    phone_confidence: str = "none"
     gallery_image_urls: list[str] = field(default_factory=list)
     image_filenames: str = ""
     image_count: int = 0

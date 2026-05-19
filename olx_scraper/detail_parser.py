@@ -14,12 +14,19 @@ from .olx_parser import normalize_text
 LOGGER = logging.getLogger(__name__)
 
 WINDOW_STATE_PATTERN = re.compile(r"window\.state\s*=\s*(\{.*?\})\s*;\s*</script>", re.DOTALL)
+WINDOW_INITIAL_STATE_PATTERN = re.compile(
+    r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;\s*</script>",
+    re.DOTALL,
+)
 DATA_LAYER_ROOMS_PATTERN = re.compile(r'"rooms"\s*:\s*"?(\d+)"?')
 DATA_LAYER_BATHS_PATTERN = re.compile(r'"bathrooms"\s*:\s*"?(\d+)"?')
 DATA_LAYER_AREA_VALUE_PATTERN = re.compile(r'"ft"\s*:\s*"?([\d\.]+)"?')
 DATA_LAYER_AREA_UNIT_PATTERN = re.compile(r'"ft_unit"\s*:\s*"([^"]+)"')
 DATA_LAYER_SELLER_TYPE_PATTERN = re.compile(r'"seller_type"\s*:\s*"([^"]+)"')
 DATA_LAYER_CATEGORY_NAME_PATTERN = re.compile(r'"category_2_name"\s*:\s*"([^"]+)"')
+PHONE_FULL_PATTERN = re.compile(r"(?<!\d)(?:\+92|0)3\d{2}[-\s]?\d{7}(?!\d)")
+PHONE_MASKED_PATTERN = re.compile(r"(?<!\d)(?:\+92|0)3[\dXx\*]{2}[-\s]?[\dXx\*]{7}(?!\d)")
+PHONE_KEY_HINTS = ("phone", "mobile", "whatsapp", "contact")
 
 
 def _extract_srcset_url(srcset_value: str | None) -> str:
@@ -59,6 +66,134 @@ def _extract_window_state(html: str) -> dict[str, Any]:
     if not isinstance(state, dict):
         return {}
     return state
+
+
+def _extract_initial_state(html: str) -> dict[str, Any]:
+    match = WINDOW_INITIAL_STATE_PATTERN.search(html)
+    if match is None:
+        return {}
+
+    raw_json = match.group(1)
+    try:
+        state = json.loads(raw_json)
+    except json.JSONDecodeError:
+        LOGGER.debug("Failed to decode window.__INITIAL_STATE__ JSON", exc_info=True)
+        return {}
+
+    if not isinstance(state, dict):
+        return {}
+    return state
+
+
+def _normalize_phone(value: str) -> str:
+    cleaned = re.sub(r"[^\d+]", "", value)
+    if cleaned.startswith("92") and not cleaned.startswith("+92"):
+        cleaned = f"+{cleaned}"
+    return cleaned
+
+
+def _extract_phone_candidates_from_value(value: Any) -> tuple[list[str], list[str]]:
+    text = normalize_text(str(value))
+    if not text:
+        return [], []
+
+    full_matches = [_normalize_phone(match.group(0)) for match in PHONE_FULL_PATTERN.finditer(text)]
+    masked_matches = [normalize_text(match.group(0)) for match in PHONE_MASKED_PATTERN.finditer(text)]
+
+    # Filter masked entries that are actually complete numbers.
+    masked_matches = [
+        value for value in masked_matches if "x" in value.lower() or "*" in value
+    ]
+    return full_matches, masked_matches
+
+
+def _walk_for_phone_candidates(
+    node: Any,
+    path: tuple[str, ...],
+    full_out: list[tuple[str, str]],
+    masked_out: list[tuple[str, str]],
+) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_normalized = normalize_text(str(key)).lower()
+            next_path = (*path, key_normalized)
+
+            if isinstance(value, (str, int, float)):
+                full_values, masked_values = _extract_phone_candidates_from_value(value)
+                if full_values or masked_values:
+                    joined_path = ".".join(next_path)
+                    for full in full_values:
+                        full_out.append((joined_path, full))
+                    for masked in masked_values:
+                        masked_out.append((joined_path, masked))
+
+            if isinstance(value, (dict, list, tuple)):
+                _walk_for_phone_candidates(value, next_path, full_out, masked_out)
+        return
+
+    if isinstance(node, list):
+        for index, value in enumerate(node):
+            _walk_for_phone_candidates(value, (*path, str(index)), full_out, masked_out)
+        return
+
+    if isinstance(node, (str, int, float)):
+        full_values, masked_values = _extract_phone_candidates_from_value(node)
+        joined_path = ".".join(path)
+        for full in full_values:
+            full_out.append((joined_path, full))
+        for masked in masked_values:
+            masked_out.append((joined_path, masked))
+
+
+def _path_contains_phone_hint(path: str) -> bool:
+    return any(hint in path for hint in PHONE_KEY_HINTS)
+
+
+def _pick_best_phone(
+    full_candidates: list[tuple[str, str]],
+    masked_candidates: list[tuple[str, str]],
+) -> tuple[str, str, str]:
+    """Return (phone, masked_phone, confidence)."""
+    if full_candidates:
+        hinted = [candidate for candidate in full_candidates if _path_contains_phone_hint(candidate[0])]
+        if hinted:
+            return hinted[0][1], "", "high"
+        return full_candidates[0][1], "", "medium"
+
+    if masked_candidates:
+        hinted = [candidate for candidate in masked_candidates if _path_contains_phone_hint(candidate[0])]
+        if hinted:
+            return "", hinted[0][1], "masked"
+        return "", masked_candidates[0][1], "masked"
+
+    return "", "", "none"
+
+
+def _extract_phone_details(html: str, state_blobs: list[dict[str, Any]]) -> dict[str, str]:
+    full_candidates: list[tuple[str, str]] = []
+    masked_candidates: list[tuple[str, str]] = []
+
+    for blob in state_blobs:
+        _walk_for_phone_candidates(blob, tuple(), full_candidates, masked_candidates)
+
+    phone, masked_phone, confidence = _pick_best_phone(full_candidates, masked_candidates)
+    if phone or masked_phone:
+        return {
+            "phone": phone,
+            "masked_phone": masked_phone,
+            "phone_confidence": confidence,
+        }
+
+    # Fallback to whole-page text scan for partially masked numbers.
+    page_full, page_masked = _extract_phone_candidates_from_value(html)
+    fallback_phone = page_full[0] if page_full else ""
+    fallback_masked = page_masked[0] if page_masked else ""
+    fallback_confidence = "medium" if fallback_phone else ("masked" if fallback_masked else "none")
+    return {
+        "phone": fallback_phone,
+        "masked_phone": fallback_masked,
+        "phone_confidence": fallback_confidence,
+    }
 
 
 def _extract_ad_state_data(state: dict[str, Any]) -> dict[str, Any]:
@@ -321,6 +456,7 @@ def parse_detail_page(html: str, detail_url: str) -> dict[str, Any]:
 
     soup = BeautifulSoup(html, "lxml")
     state = _extract_window_state(html)
+    initial_state = _extract_initial_state(html)
     ad_data = _extract_ad_state_data(state)
 
     state_fields = _extract_formatted_fields(ad_data)
@@ -377,6 +513,7 @@ def parse_detail_page(html: str, detail_url: str) -> dict[str, Any]:
         posted_time_text = _extract_posted_time_from_html(soup)
 
     gallery_image_urls = _extract_gallery_urls(soup)
+    phone_details = _extract_phone_details(html, [state, initial_state, ad_data])
 
     if not description:
         LOGGER.warning(
@@ -393,6 +530,9 @@ def parse_detail_page(html: str, detail_url: str) -> dict[str, Any]:
         "seller_type": seller_type,
         "property_type": property_type,
         "posted_time_text": posted_time_text,
+        "phone": phone_details["phone"],
+        "masked_phone": phone_details["masked_phone"],
+        "phone_confidence": phone_details["phone_confidence"],
         "gallery_image_urls": gallery_image_urls,
         "image_count": len(gallery_image_urls),
     }

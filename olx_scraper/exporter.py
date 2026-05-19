@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Iterable
@@ -24,6 +25,9 @@ EXPORT_COLUMNS = [
     "bathrooms",
     "seller_type",
     "property_type",
+    "phone",
+    "masked_phone",
+    "phone_confidence",
     "listing_url",
     "image_url",
     "image_file",
@@ -63,3 +67,17 @@ def export_to_excel(records: Iterable[ListingRecord], output_file: Path) -> int:
             worksheet.column_dimensions[cell.column_letter].width = min(max_cell_length + 2, 70)
 
     return len(dataframe)
+
+
+def export_to_jsonl(records: Iterable[ListingRecord], output_file: Path) -> int:
+    """Export records as JSON Lines for machine-readable ingestion workflows."""
+
+    os.makedirs(output_file.parent, exist_ok=True)
+
+    count = 0
+    with output_file.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
+            count += 1
+
+    return count

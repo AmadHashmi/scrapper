@@ -35,6 +35,14 @@ class DetailParserFixtureTest(unittest.TestCase):
         self.assertEqual(detail["image_count"], len(detail["gallery_image_urls"]))
         self.assertEqual(len(set(detail["gallery_image_urls"])), len(detail["gallery_image_urls"]))
 
+    def test_phone_fields_exist_with_valid_confidence(self) -> None:
+        detail = parse_detail_page(self.html, DETAIL_URL)
+
+        self.assertIn("phone", detail)
+        self.assertIn("masked_phone", detail)
+        self.assertIn("phone_confidence", detail)
+        self.assertIn(detail["phone_confidence"], {"high", "medium", "masked", "none"})
+
 
 if __name__ == "__main__":
     unittest.main()

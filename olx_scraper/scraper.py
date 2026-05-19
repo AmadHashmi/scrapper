@@ -91,6 +91,18 @@ class OLXPropertyScraper:
         if posted_time_text:
             record.posted_time_text = posted_time_text
 
+        phone = detail_data.get("phone", "")
+        if phone:
+            record.phone = phone
+
+        masked_phone = detail_data.get("masked_phone", "")
+        if masked_phone:
+            record.masked_phone = masked_phone
+
+        phone_confidence = detail_data.get("phone_confidence", "")
+        if phone_confidence:
+            record.phone_confidence = phone_confidence
+
         gallery_image_urls = detail_data.get("gallery_image_urls", [])
         if gallery_image_urls:
             record.gallery_image_urls = gallery_image_urls

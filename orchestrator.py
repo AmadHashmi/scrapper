@@ -1,36 +1,35 @@
 #!/usr/bin/env python
-"""
-OLX scraper orchestrator.
+"""Two-pass OLX scraper orchestrator with checkpointing.
 
-Runs multiple gentle scraping sessions separated by cooldown periods to work
-around OLX IP-based rate limiting. Each session writes to a timestamped Excel
-file so data from previous sessions is never overwritten.
-
-Usage examples
---------------
-# Quick test (1 session, no cooldown):
-python orchestrator.py --url "..." --sessions 1 --cooldown-minutes 0 --session-pages 1 --page-delay 30 --max-runtime 5
-
-# Demo run (1 session with 5 min cooldown shown):
-python orchestrator.py --url "..." --sessions 1 --cooldown-minutes 5 --session-pages 2 --page-delay 90 --max-runtime 10
-
-# Overnight run (5 sessions, 45 min cooldown between each):
-python orchestrator.py --url "..." --sessions 5 --cooldown-minutes 45 --session-pages 2 --page-delay 90 --max-runtime 15
+Modes:
+- discover: crawl search pages and enqueue listing URLs + base metadata
+- enrich: process queue items one-by-one, scrape detail page data, and persist output
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import random
-import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+
+from olx_scraper.config import DEFAULT_USER_AGENT, ScraperSettings
+from olx_scraper.detail_parser import parse_detail_page
+from olx_scraper.exporter import export_to_excel, export_to_jsonl
+from olx_scraper.http_client import HttpClient
+from olx_scraper.image_downloader import download_listing_images
+from olx_scraper.models import ListingRecord
+from olx_scraper.olx_parser import parse_listings
+from olx_scraper.scraper import build_page_url
+from persistence.db import CheckpointDB
 
 
 LOGGER = logging.getLogger(__name__)
+ADAPTIVE_COOLDOWN_MINUTES = [15, 45, 120]
 
 
 def configure_logging(verbose: bool) -> None:
@@ -42,213 +41,294 @@ def configure_logging(verbose: bool) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="OLX scraper orchestrator – runs sessions with cooldown between them"
-    )
-    parser.add_argument(
-        "--url",
-        required=True,
-        help="OLX search URL with {page} placeholder",
-    )
-    parser.add_argument("--sessions", type=int, default=3, help="Total number of scraping sessions to run")
-    parser.add_argument("--session-pages", type=int, default=2, help="Pages to scrape per session")
-    parser.add_argument(
-        "--page-delay",
-        type=float,
-        default=90.0,
-        help="Base delay in seconds between pages inside a session (+/-25%% jitter applied by scraper)",
-    )
-    parser.add_argument(
-        "--max-runtime",
-        type=float,
-        default=10.0,
-        help="Maximum runtime in minutes per session",
-    )
-    parser.add_argument(
-        "--cooldown-minutes",
-        type=float,
-        default=30.0,
-        help="Base cooldown in minutes between sessions",
-    )
-    parser.add_argument(
-        "--cooldown-jitter",
-        type=float,
-        default=20.0,
-        help="Jitter percentage applied to cooldown (e.g. 20 means +/-20%%)",
-    )
-    parser.add_argument("--output-dir", default="output", help="Directory for output files")
-    parser.add_argument("--retries", type=int, default=1, help="Retry attempts per request")
-    parser.add_argument("--verbose", action="store_true", help="Pass --verbose to the scraper and show debug logs")
+    parser = argparse.ArgumentParser(description="OLX discover/enrich orchestrator")
+    parser.add_argument("--mode", choices=["discover", "enrich"], required=True)
+    parser.add_argument("--url", required=True, help="OLX search URL (supports {page} placeholder)")
+    parser.add_argument("--type", choices=["all", "rent", "sale"], default="all")
+    parser.add_argument("--max-pages", type=int, default=5, help="Max search pages to discover")
+    parser.add_argument("--max-listings", type=int, default=100, help="Max queue listings to enrich")
+    parser.add_argument("--timeout", type=int, default=20)
+    parser.add_argument("--delay-min", type=float, default=1.2)
+    parser.add_argument("--delay-max", type=float, default=2.8)
+    parser.add_argument("--page-delay", type=float, default=45.0)
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--backoff", type=float, default=1.2)
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
+    parser.add_argument("--db-path", default="output/checkpoint.sqlite3")
+    parser.add_argument("--output-dir", default="output")
+    parser.add_argument("--excel-name", default="olx_property_listings.xlsx")
+    parser.add_argument("--jsonl-name", default="listings.jsonl")
+    parser.add_argument("--images-dir", default="images")
+    parser.add_argument("--download-images", action="store_true", help="Download gallery images in enrich mode")
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
-def build_scraper_cmd(
-    url: str,
-    pages: int,
-    page_delay: float,
-    max_runtime: float,
-    output_file: Path,
-    retries: int,
-    verbose: bool,
-) -> list[str]:
-    cmd = [
-        sys.executable,
-        "main.py",
-        "--url", url,
-        "--pages", str(pages),
-        "--page-delay", str(page_delay),
-        "--max-runtime", str(max_runtime),
-        "--output", str(output_file),
-        "--retries", str(retries),
-    ]
-    if verbose:
-        cmd.append("--verbose")
-    return cmd
+def build_settings(args: argparse.Namespace) -> ScraperSettings:
+    return ScraperSettings(
+        request_timeout_seconds=args.timeout,
+        delay_min_seconds=args.delay_min,
+        delay_max_seconds=args.delay_max,
+        page_delay_seconds=args.page_delay,
+        max_retries=args.retries,
+        backoff_factor=args.backoff,
+        max_pages=max(1, args.max_pages),
+        output_directory=args.output_dir,
+        images_subdirectory=args.images_dir,
+        excel_filename=args.excel_name,
+    )
 
 
-def run_session(session_num: int, total_sessions: int, cmd: list[str], output_file: Path) -> bool:
-    """Run one scraper session; return True on success."""
-    LOGGER.info("=== Session %d/%d starting ===", session_num, total_sessions)
-    LOGGER.info("Output file: %s", output_file)
-    LOGGER.debug("Command: %s", " ".join(cmd))
-
-    start = time.monotonic()
-    try:
-        result = subprocess.run(cmd, check=False)
-    except KeyboardInterrupt:
-        LOGGER.info("Session %d interrupted by user.", session_num)
-        raise
-
-    elapsed = time.monotonic() - start
-    if result.returncode == 0:
-        LOGGER.info(
-            "=== Session %d/%d finished (%.0fs) ===",
-            session_num,
-            total_sessions,
-            elapsed,
-        )
-        if output_file.exists():
-            size_kb = output_file.stat().st_size // 1024
-            LOGGER.info("Output confirmed: %s (%d KB)", output_file, size_kb)
-        else:
-            LOGGER.warning("Output file not found after session: %s", output_file)
+def matches_listing_type(record: ListingRecord, listing_type: str) -> bool:
+    if listing_type == "all":
         return True
-    else:
-        LOGGER.warning(
-            "Session %d exited with code %d (elapsed %.0fs)",
-            session_num,
-            result.returncode,
-            elapsed,
-        )
-        return False
+
+    haystack = " ".join(
+        [
+            record.title.lower(),
+            record.details_text.lower(),
+            record.location_text.lower(),
+        ]
+    )
+    if listing_type == "rent":
+        return "rent" in haystack
+    return "sale" in haystack or "sell" in haystack
 
 
-def cooldown_sleep(cooldown_minutes: float, jitter_pct: float) -> None:
-    """Sleep for cooldown duration with jitter; handles Ctrl+C gracefully."""
-    jitter_fraction = jitter_pct / 100.0
-    actual_seconds = cooldown_minutes * 60 * random.uniform(
-        1 - jitter_fraction, 1 + jitter_fraction
+def wait_with_logs(total_seconds: float) -> None:
+    deadline = time.monotonic() + max(0.0, total_seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        chunk = min(remaining, 60.0)
+        time.sleep(chunk)
+        still_remaining = deadline - time.monotonic()
+        if still_remaining > 10:
+            LOGGER.info("Cooldown active: %.0fs remaining", still_remaining)
+
+
+def discover_mode(args: argparse.Namespace, settings: ScraperSettings, db: CheckpointDB) -> int:
+    http = HttpClient(
+        user_agent=args.user_agent,
+        timeout_seconds=settings.request_timeout_seconds,
+        min_delay_seconds=settings.delay_min_seconds,
+        max_delay_seconds=settings.delay_max_seconds,
+        max_retries=settings.max_retries,
+        backoff_factor=settings.backoff_factor,
     )
-    actual_minutes = actual_seconds / 60
-    LOGGER.info(
-        "Cooldown: waiting %.0fs (~%.1f min) before next session...",
-        actual_seconds,
-        actual_minutes,
-    )
-    deadline = time.monotonic() + actual_seconds
+    discovered_total = 0
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+        for page_num in range(1, args.max_pages + 1):
+            page_url = build_page_url(args.url, page_num)
+            LOGGER.info("Discover page %d/%d: %s", page_num, args.max_pages, page_url)
+            response = http.get(page_url)
+
+            if response.status_code == 429:
+                LOGGER.warning("Rate limited in discover mode on page %d; stopping early", page_num)
+                return 1
+            if response.status_code >= 400:
+                LOGGER.warning("Page fetch failed with HTTP %s: %s", response.status_code, page_url)
+                continue
+
+            page_records = parse_listings(response.text, page_url)
+            page_records = [record for record in page_records if matches_listing_type(record, args.type)]
+            if not page_records:
+                LOGGER.info("No listings parsed on page %d", page_num)
+            inserted = db.upsert_discovered(page_records)
+            discovered_total += inserted
+            LOGGER.info("Queued %d listing(s) from page %d", inserted, page_num)
+
+            if page_num < args.max_pages:
+                jitter = random.uniform(0.75, 1.25)
+                sleep_seconds = max(0.0, settings.page_delay_seconds * jitter)
+                if sleep_seconds > 0:
+                    LOGGER.info("Sleeping %.1fs before next discover page", sleep_seconds)
+                    wait_with_logs(sleep_seconds)
+    finally:
+        http.close()
+
+    counts = db.queue_counts()
+    LOGGER.info("Discover complete. Newly queued=%d, totals=%s", discovered_total, counts)
+    return 0
+
+
+def compose_enriched_record(source: ListingRecord, detail: dict[str, object]) -> ListingRecord:
+    source.description = str(detail.get("description") or source.description)
+    source.area_text = str(detail.get("area_text") or source.area_text)
+    source.bedrooms = detail.get("bedrooms") if detail.get("bedrooms") is not None else source.bedrooms
+    source.bathrooms = detail.get("bathrooms") if detail.get("bathrooms") is not None else source.bathrooms
+    source.address = str(detail.get("address") or source.address)
+    source.seller_type = str(detail.get("seller_type") or source.seller_type)
+    source.property_type = str(detail.get("property_type") or source.property_type)
+    source.posted_time_text = str(detail.get("posted_time_text") or source.posted_time_text)
+    source.phone = str(detail.get("phone") or source.phone)
+    source.masked_phone = str(detail.get("masked_phone") or source.masked_phone)
+    source.phone_confidence = str(detail.get("phone_confidence") or source.phone_confidence)
+
+    gallery = detail.get("gallery_image_urls")
+    if isinstance(gallery, list):
+        source.gallery_image_urls = [str(item) for item in gallery if str(item).strip()]
+        source.image_count = len(source.gallery_image_urls)
+        if source.image_count > 0 and not source.image_url:
+            source.image_url = source.gallery_image_urls[0]
+    return source
+
+
+def apply_rate_limit_cooldown(db: CheckpointDB, rate_limit_hits: int) -> datetime:
+    index = min(max(rate_limit_hits - 1, 0), len(ADAPTIVE_COOLDOWN_MINUTES) - 1)
+    cooldown_minutes = ADAPTIVE_COOLDOWN_MINUTES[index]
+    cooldown_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
+    cooldown_iso = cooldown_until.replace(microsecond=0).isoformat()
+    db.set_run_state("cooldown_until", cooldown_iso)
+    LOGGER.warning("Rate limited. Cooldown set to %d minute(s) until %s", cooldown_minutes, cooldown_iso)
+    return cooldown_until
+
+
+def get_active_cooldown(db: CheckpointDB) -> datetime | None:
+    raw = db.get_run_state("cooldown_until")
+    if raw is None:
+        return None
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if value <= datetime.utcnow():
+        db.set_run_state("cooldown_until", "")
+        return None
+    return value
+
+
+def enrich_mode(args: argparse.Namespace, settings: ScraperSettings, db: CheckpointDB) -> int:
+    db.reset_in_progress_to_retry()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_dir / args.jsonl_name
+
+    consecutive_rate_limits = 0
+    processed = 0
+    http = HttpClient(
+        user_agent=args.user_agent,
+        timeout_seconds=settings.request_timeout_seconds,
+        min_delay_seconds=settings.delay_min_seconds,
+        max_delay_seconds=settings.delay_max_seconds,
+        max_retries=settings.max_retries,
+        backoff_factor=settings.backoff_factor,
+    )
+    try:
+        while processed < args.max_listings:
+            active_cooldown = get_active_cooldown(db)
+            if active_cooldown is not None:
+                wait_seconds = (active_cooldown - datetime.utcnow()).total_seconds()
+                if wait_seconds > 0:
+                    wait_with_logs(wait_seconds)
+
+            item = db.claim_next_for_enrichment()
+            if item is None:
+                LOGGER.info("Queue exhausted for now; nothing left to enrich.")
                 break
-            # Log progress every 60 s so the user knows the process is alive.
-            chunk = min(remaining, 60.0)
-            time.sleep(chunk)
-            remaining = deadline - time.monotonic()
-            if remaining > 5:
-                LOGGER.info("Cooldown: %.0fs remaining...", remaining)
-    except KeyboardInterrupt:
-        LOGGER.info("Cooldown interrupted by user.")
-        raise
+
+            listing_id = str(item["listing_id"])
+            listing_url = str(item["listing_url"])
+            source_record = db.load_source_record(str(item["source_json"]))
+            attempts = int(item["attempts"]) + 1
+
+            try:
+                response = http.get(listing_url)
+                if response.status_code == 429:
+                    consecutive_rate_limits += 1
+                    cooldown_until = apply_rate_limit_cooldown(db, consecutive_rate_limits)
+                    db.mark_retry(
+                        listing_id,
+                        f"HTTP 429 rate limit on attempt {attempts}",
+                        cooldown_until.replace(microsecond=0).isoformat(),
+                    )
+                    continue
+
+                if response.status_code >= 500:
+                    retry_at = (datetime.utcnow() + timedelta(minutes=10)).replace(microsecond=0).isoformat()
+                    db.mark_retry(listing_id, f"HTTP {response.status_code}", retry_at)
+                    continue
+
+                if response.status_code >= 400:
+                    if attempts >= 3:
+                        db.mark_failed(listing_id, f"HTTP {response.status_code}")
+                    else:
+                        retry_at = (datetime.utcnow() + timedelta(minutes=30)).replace(microsecond=0).isoformat()
+                        db.mark_retry(listing_id, f"HTTP {response.status_code}", retry_at)
+                    continue
+
+                detail = parse_detail_page(response.text, listing_url)
+                enriched_record = compose_enriched_record(source_record, detail)
+
+                if args.download_images and enriched_record.gallery_image_urls:
+                    download_listing_images(
+                        [enriched_record],
+                        output_images_dir=output_dir / args.images_dir,
+                        http_client=http,
+                    )
+
+                db.save_listing_payload(listing_id, enriched_record.__dict__)
+                db.mark_done(listing_id)
+
+                # Keep an always-fresh canonical JSONL artifact while the run progresses.
+                done_records = db.list_done_records()
+                export_to_jsonl(done_records, jsonl_path)
+
+                processed += 1
+                consecutive_rate_limits = 0
+                jitter = random.uniform(settings.delay_min_seconds, settings.delay_max_seconds)
+                if jitter > 0:
+                    time.sleep(jitter)
+            except Exception as exc:  # noqa: BLE001
+                if attempts >= 4:
+                    db.mark_failed(listing_id, str(exc))
+                else:
+                    retry_at = (datetime.utcnow() + timedelta(minutes=15)).replace(microsecond=0).isoformat()
+                    db.mark_retry(listing_id, str(exc), retry_at)
+
+    finally:
+        http.close()
+
+    done_records = db.list_done_records()
+    jsonl_count = export_to_jsonl(done_records, jsonl_path)
+    excel_path = output_dir / args.excel_name
+    excel_count = export_to_excel(done_records, excel_path)
+    LOGGER.info(
+        "Enrich complete. Processed=%d done=%d jsonl=%s (%d) excel=%s (%d)",
+        processed,
+        len(done_records),
+        jsonl_path,
+        jsonl_count,
+        excel_path,
+        excel_count,
+    )
+    LOGGER.info("Queue status: %s", json.dumps(db.queue_counts(), ensure_ascii=False))
+    return 0
 
 
 def main() -> int:
     args = parse_args()
     configure_logging(verbose=args.verbose)
 
-    if args.sessions < 1:
-        LOGGER.error("--sessions must be >= 1")
+    if args.max_pages < 1:
+        LOGGER.error("--max-pages must be >= 1")
         return 2
-    if args.session_pages < 1:
-        LOGGER.error("--session-pages must be >= 1")
+    if args.max_listings < 1:
+        LOGGER.error("--max-listings must be >= 1")
         return 2
-    if args.cooldown_minutes < 0:
-        LOGGER.error("--cooldown-minutes must be >= 0")
+    if args.delay_min < 0 or args.delay_max < 0 or args.delay_min > args.delay_max:
+        LOGGER.error("Invalid delay range")
         return 2
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    LOGGER.info(
-        "Orchestrator starting: %d session(s), %d page(s)/session, "
-        "%.0fs page-delay, %.1f min cooldown (+/-%.0f%% jitter)",
-        args.sessions,
-        args.session_pages,
-        args.page_delay,
-        args.cooldown_minutes,
-        args.cooldown_jitter,
-    )
-
-    completed_sessions: list[tuple[int, Path]] = []
-    failed_sessions: list[int] = []
-
-    for session_num in range(1, args.sessions + 1):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = output_dir / f"olx_property_listings_{timestamp}.xlsx"
-
-        cmd = build_scraper_cmd(
-            url=args.url,
-            pages=args.session_pages,
-            page_delay=args.page_delay,
-            max_runtime=args.max_runtime,
-            output_file=output_file,
-            retries=args.retries,
-            verbose=args.verbose,
-        )
-
-        try:
-            success = run_session(session_num, args.sessions, cmd, output_file)
-        except KeyboardInterrupt:
-            LOGGER.info("Orchestrator interrupted after session %d. Exiting.", session_num)
-            break
-
-        if success:
-            completed_sessions.append((session_num, output_file))
-        else:
-            failed_sessions.append(session_num)
-
-        # Cooldown between sessions (not after the very last one).
-        if session_num < args.sessions and args.cooldown_minutes > 0:
-            try:
-                cooldown_sleep(args.cooldown_minutes, args.cooldown_jitter)
-            except KeyboardInterrupt:
-                LOGGER.info("Orchestrator interrupted during cooldown. Exiting.")
-                break
-
-    # ── Final summary ──────────────────────────────────────────────────────────
-    LOGGER.info(
-        "=== Orchestrator done: %d completed, %d failed ===",
-        len(completed_sessions),
-        len(failed_sessions),
-    )
-    for num, path in completed_sessions:
-        status = "EXISTS" if path.exists() else "MISSING"
-        size_info = f" ({path.stat().st_size // 1024} KB)" if path.exists() else ""
-        LOGGER.info("  Session %d | %s | %s%s", num, status, path, size_info)
-    for num in failed_sessions:
-        LOGGER.warning("  Session %d | FAILED", num)
-
-    return 0 if not failed_sessions else 1
+    settings = build_settings(args)
+    db = CheckpointDB(Path(args.db_path))
+    try:
+        if args.mode == "discover":
+            return discover_mode(args, settings, db)
+        return enrich_mode(args, settings, db)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
