@@ -42,14 +42,32 @@ def configure_logging(verbose: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OLX discover/enrich orchestrator")
-    parser.add_argument("--mode", choices=["discover", "enrich"], required=True)
-    parser.add_argument("--url", required=True, help="OLX search URL (supports {page} placeholder)")
+    parser.add_argument("--mode", choices=["discover", "enrich", "export"], required=True)
+    parser.add_argument("--url", required=False, help="OLX search URL (supports {page} placeholder)")
     parser.add_argument("--type", choices=["all", "rent", "sale"], default="all")
     parser.add_argument("--max-pages", type=int, default=5, help="Max search pages to discover")
     parser.add_argument("--max-listings", type=int, default=100, help="Max queue listings to enrich")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--delay-min", type=float, default=1.2)
     parser.add_argument("--delay-max", type=float, default=2.8)
+    parser.add_argument(
+        "--image-delay-min",
+        type=float,
+        default=None,
+        help="Minimum delay between image downloads (defaults to --delay-min)",
+    )
+    parser.add_argument(
+        "--image-delay-max",
+        type=float,
+        default=None,
+        help="Maximum delay between image downloads (defaults to --delay-max)",
+    )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=0,
+        help="Maximum images to download per listing (0 means no limit)",
+    )
     parser.add_argument("--page-delay", type=float, default=45.0)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--backoff", type=float, default=1.2)
@@ -61,7 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--images-dir", default="images")
     parser.add_argument("--download-images", action="store_true", help="Download gallery images in enrich mode")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.image_delay_min is None:
+        args.image_delay_min = args.delay_min
+    if args.image_delay_max is None:
+        args.image_delay_max = args.delay_max
+    return args
 
 
 def build_settings(args: argparse.Namespace) -> ScraperSettings:
@@ -109,6 +132,10 @@ def wait_with_logs(total_seconds: float) -> None:
 
 
 def discover_mode(args: argparse.Namespace, settings: ScraperSettings, db: CheckpointDB) -> int:
+    if not args.url:
+        LOGGER.error("--url is required in discover mode")
+        return 2
+
     http = HttpClient(
         user_agent=args.user_agent,
         timeout_seconds=settings.request_timeout_seconds,
@@ -135,7 +162,7 @@ def discover_mode(args: argparse.Namespace, settings: ScraperSettings, db: Check
             page_records = [record for record in page_records if matches_listing_type(record, args.type)]
             if not page_records:
                 LOGGER.info("No listings parsed on page %d", page_num)
-            inserted = db.upsert_discovered(page_records)
+            inserted = db.upsert_discovered(page_records, args.type)
             discovered_total += inserted
             LOGGER.info("Queued %d listing(s) from page %d", inserted, page_num)
 
@@ -230,6 +257,7 @@ def enrich_mode(args: argparse.Namespace, settings: ScraperSettings, db: Checkpo
 
             listing_id = str(item["listing_id"])
             listing_url = str(item["listing_url"])
+            listing_type = str(item["listing_type"] or "all")
             source_record = db.load_source_record(str(item["source_json"]))
             attempts = int(item["attempts"]) + 1
 
@@ -262,13 +290,26 @@ def enrich_mode(args: argparse.Namespace, settings: ScraperSettings, db: Checkpo
                 enriched_record = compose_enriched_record(source_record, detail)
 
                 if args.download_images and enriched_record.gallery_image_urls:
-                    download_listing_images(
-                        [enriched_record],
-                        output_images_dir=output_dir / args.images_dir,
-                        http_client=http,
-                    )
+                    original_gallery = list(enriched_record.gallery_image_urls)
+                    if args.max_images > 0:
+                        enriched_record.gallery_image_urls = original_gallery[: args.max_images]
 
-                db.save_listing_payload(listing_id, enriched_record.__dict__)
+                    original_min_delay = http.min_delay_seconds
+                    original_max_delay = http.max_delay_seconds
+                    http.min_delay_seconds = args.image_delay_min
+                    http.max_delay_seconds = args.image_delay_max
+                    try:
+                        download_listing_images(
+                            [enriched_record],
+                            output_images_dir=output_dir / args.images_dir,
+                            http_client=http,
+                        )
+                    finally:
+                        http.min_delay_seconds = original_min_delay
+                        http.max_delay_seconds = original_max_delay
+                        enriched_record.gallery_image_urls = original_gallery
+
+                db.save_listing_payload(listing_id, listing_type, enriched_record.__dict__)
                 db.mark_done(listing_id)
 
                 # Keep an always-fresh canonical JSONL artifact while the run progresses.
@@ -307,6 +348,27 @@ def enrich_mode(args: argparse.Namespace, settings: ScraperSettings, db: Checkpo
     return 0
 
 
+def export_mode(args: argparse.Namespace, db: CheckpointDB) -> int:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    done_records = db.list_done_records()
+    jsonl_path = output_dir / args.jsonl_name
+    excel_path = output_dir / args.excel_name
+
+    jsonl_count = export_to_jsonl(done_records, jsonl_path)
+    excel_count = export_to_excel(done_records, excel_path)
+    LOGGER.info(
+        "Export complete. done=%d jsonl=%s (%d) excel=%s (%d)",
+        len(done_records),
+        jsonl_path,
+        jsonl_count,
+        excel_path,
+        excel_count,
+    )
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     configure_logging(verbose=args.verbose)
@@ -320,13 +382,21 @@ def main() -> int:
     if args.delay_min < 0 or args.delay_max < 0 or args.delay_min > args.delay_max:
         LOGGER.error("Invalid delay range")
         return 2
+    if args.image_delay_min < 0 or args.image_delay_max < 0 or args.image_delay_min > args.image_delay_max:
+        LOGGER.error("Invalid image delay range")
+        return 2
+    if args.max_images < 0:
+        LOGGER.error("--max-images must be >= 0")
+        return 2
 
     settings = build_settings(args)
     db = CheckpointDB(Path(args.db_path))
     try:
         if args.mode == "discover":
             return discover_mode(args, settings, db)
-        return enrich_mode(args, settings, db)
+        if args.mode == "enrich":
+            return enrich_mode(args, settings, db)
+        return export_mode(args, db)
     finally:
         db.close()
 
