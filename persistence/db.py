@@ -46,6 +46,7 @@ class CheckpointDB:
                 CREATE TABLE IF NOT EXISTS listings_queue (
                     listing_id TEXT PRIMARY KEY,
                     listing_url TEXT NOT NULL UNIQUE,
+                    listing_type TEXT NOT NULL DEFAULT 'all',
                     source_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -61,6 +62,7 @@ class CheckpointDB:
                 """
                 CREATE TABLE IF NOT EXISTS listing_data (
                     listing_id TEXT PRIMARY KEY,
+                    listing_type TEXT NOT NULL DEFAULT 'all',
                     payload_json TEXT NOT NULL,
                     phone TEXT,
                     masked_phone TEXT,
@@ -82,6 +84,16 @@ class CheckpointDB:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_queue_status_retry ON listings_queue(status, next_retry_at)"
             )
+            self._ensure_column(conn, "listings_queue", "listing_type", "TEXT NOT NULL DEFAULT 'all'")
+            self._ensure_column(conn, "listing_data", "listing_type", "TEXT NOT NULL DEFAULT 'all'")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl_fragment: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {str(row[1]) for row in rows}
+        if column in existing:
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_fragment}")
 
     def set_run_state(self, key: str, value: str) -> None:
         timestamp = now_iso()
@@ -122,7 +134,7 @@ class CheckpointDB:
             )
         return int(cursor.rowcount)
 
-    def upsert_discovered(self, records: list[ListingRecord]) -> int:
+    def upsert_discovered(self, records: list[ListingRecord], listing_type: str) -> int:
         discovered = 0
         timestamp = now_iso()
         with self.transaction() as conn:
@@ -133,20 +145,23 @@ class CheckpointDB:
                     INSERT INTO listings_queue(
                         listing_id,
                         listing_url,
+                        listing_type,
                         source_json,
                         status,
                         discovered_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, 'pending', ?, ?)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?)
                     ON CONFLICT(listing_id) DO UPDATE
                     SET listing_url = excluded.listing_url,
+                        listing_type = excluded.listing_type,
                         source_json = excluded.source_json,
                         updated_at = excluded.updated_at
                     """,
                     (
                         record.listing_id,
                         record.listing_url,
+                        listing_type,
                         source_json,
                         timestamp,
                         timestamp,
@@ -161,7 +176,7 @@ class CheckpointDB:
         with self.transaction() as conn:
             row = conn.execute(
                 """
-                SELECT listing_id, listing_url, source_json, attempts
+                                SELECT listing_id, listing_url, listing_type, source_json, attempts
                 FROM listings_queue
                 WHERE status IN ('pending', 'retry')
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
@@ -230,15 +245,16 @@ class CheckpointDB:
                 (error_text[:500], timestamp, listing_id),
             )
 
-    def save_listing_payload(self, listing_id: str, payload: dict[str, Any]) -> None:
+    def save_listing_payload(self, listing_id: str, listing_type: str, payload: dict[str, Any]) -> None:
         timestamp = now_iso()
         with self.transaction() as conn:
             conn.execute(
                 """
-                INSERT INTO listing_data(listing_id, payload_json, phone, masked_phone, phone_confidence, saved_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO listing_data(listing_id, listing_type, payload_json, phone, masked_phone, phone_confidence, saved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(listing_id) DO UPDATE
-                SET payload_json = excluded.payload_json,
+                SET listing_type = excluded.listing_type,
+                    payload_json = excluded.payload_json,
                     phone = excluded.phone,
                     masked_phone = excluded.masked_phone,
                     phone_confidence = excluded.phone_confidence,
@@ -246,6 +262,7 @@ class CheckpointDB:
                 """,
                 (
                     listing_id,
+                    listing_type,
                     json.dumps(payload, ensure_ascii=False),
                     str(payload.get("phone") or ""),
                     str(payload.get("masked_phone") or ""),
